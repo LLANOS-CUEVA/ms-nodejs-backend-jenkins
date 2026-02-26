@@ -9,7 +9,7 @@ pipeline {
         ACR_LOGIN_SERVER = "${ACR_NAME}.azurecr.io"
         IMAGE_NAME = "my-nodejs-app-${APELLIDO}"
         RESOURCE_GROUP = "rg-cicd-terraform-app-mjllanosc"
-        AKS_NAME = "aks-dev-westus2"
+        AKS_NAME = "aks-dev-eastus"
     }
 
     stages {
