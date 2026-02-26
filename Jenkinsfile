@@ -14,31 +14,25 @@ pipeline {
 
     stages {
 
-        stage('Hello world') {
+        stage('[CI] Instalar dependencias de app') {
             steps {
-                script { 
-                    // Declarar más variables de entorno
-                    env.VARIABLE = "demo123"
-                }
-                // Primer step
-                sh '''
-                  echo ">>> Impresión Hello world"
-                  echo "Hello world"
-                  echo "Variable declarada en script: $VARIABLE"
-                  echo "Variable declarada en environment: $APELLIDO"
-                '''
-                // Step adicional
-                sh '''
-                  echo ">>> Versiones instaladas:"
-                  node -v
-                  npm -v
-                  docker --version
-                  az version
-                '''
+                sh 'npm install'
             }
         }
 
-        stage('Azure Login') {
+        stage('[CI] Ejecutar pruebas unitarias') {
+            steps {
+                sh 'npm run test:unit'
+            }
+        }
+
+        stage('[CI] Ejecutar pruebas de integración') {
+            steps {
+                sh 'npm run test:integration'
+            }
+        }
+
+        stage('[CI] Azure Login') {
             steps {
                 withCredentials([
                     string(credentialsId: 'azure-clientId',       variable: 'AZ_CLIENT_ID'),
@@ -59,7 +53,7 @@ pipeline {
             }
         }
 
-        stage('AKS Credentials') {
+        stage('[CI] AKS Credentials') {
             steps {
                 sh '''
                   echo ">>> Obteniendo credenciales de AKS..."
@@ -71,7 +65,7 @@ pipeline {
             }
         }
         
-        stage('[CI] Get Git Commit Short SHA') {
+        stage('[CI] Generar ID corto del commit') {
             steps {
                 script {
                     env.IMAGE_TAG = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
@@ -80,7 +74,7 @@ pipeline {
             }
         }
 
-        stage('[CI] Build & Push to ACR') {
+        stage('[CI] Build and Push Docker Image') {
             steps {
                 sh '''
                   echo ">>> Login al ACR..."
@@ -95,44 +89,33 @@ pipeline {
             }
         }
 
-        stage('[CD-DEV] Set Image Tag in k8s.yml') {
+        // --- CD DEV ---
+        stage('[CD-DEV] Deploy a AKS') {
             steps {
                 script { 
-                    // Declarar más variables de entorno
-                    env.API_PROVIDER_URL = "https://dev.api.com"
                     env.ENV = "dev"
                 }
-
                 sh '''
-                  echo ">>> Renderizando k8s.yml..."
-                  
+                  echo ">>> Renderizando k8s.yml para DEV..."
                   envsubst < k8s.yml > k8s-dev.yml
-                  cat k8s-dev.yml
-
+                  
+                  echo ">>> Desplegando en AKS (DEV)..."
+                  az aks command invoke \
+                    --resource-group $RESOURCE_GROUP \
+                    --name $AKS_NAME \
+                    --command "kubectl apply -f k8s-dev.yml" \
+                    --file k8s-dev.yml
                 '''
             }
         }
 
-        stage('[CD-DEV] Deploy to AKS') {
-          steps {
-            sh '''
-                az aks command invoke \
-                  --resource-group $RESOURCE_GROUP \
-                  --name $AKS_NAME \
-                  --command "kubectl apply -f k8s-dev.yml" \
-                  --file k8s-dev.yml
-
-            '''
-          }
-        }
-        stage('[CD-DEV] Get LoadBalancer IP') {
+        stage('[CD-DEV] Imprimir IP del servicio') {
             steps {
                 sh '''
-                  echo ">>> Intentando obtener IP del LoadBalancer..."
-
-                  SERVICE_NAME="my-nodejs-service-${APELLIDO}-${ENV}"  # Cambia esto por el nombre real de tu Service
+                  echo ">>> Intentando obtener IP del LoadBalancer (DEV)..."
+                  SERVICE_NAME="my-nodejs-service-${APELLIDO}-dev"
                   LB_IP=""
-                  MAX_RETRIES=5
+                  MAX_RETRIES=10
                   RETRY_COUNT=0
         
                   while [ -z "$LB_IP" ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
@@ -146,9 +129,114 @@ pipeline {
         
                   if [ -z "$LB_IP" ]; then
                     echo ">>> No se pudo obtener la IP del LoadBalancer después de $MAX_RETRIES intentos."
-                    exit 1
                   else
-                    echo ">>> IP del LoadBalancer asignada: $LB_IP"
+                    echo ">>> IP del LoadBalancer (DEV): $LB_IP"
+                  fi
+                '''
+            }
+        }
+
+        // --- CD QA ---
+        stage('Aprobación QA') {
+            steps {
+                input message: '¿Desea desplegar a QA?', ok: 'Aprobar'
+            }
+        }
+
+        stage('[CD-QA] Deploy a AKS') {
+            steps {
+                script { 
+                    env.ENV = "qa"
+                }
+                sh '''
+                  echo ">>> Renderizando k8s.yml para QA..."
+                  envsubst < k8s.yml > k8s-qa.yml
+                  
+                  echo ">>> Desplegando en AKS (QA)..."
+                  az aks command invoke \
+                    --resource-group $RESOURCE_GROUP \
+                    --name $AKS_NAME \
+                    --command "kubectl apply -f k8s-qa.yml" \
+                    --file k8s-qa.yml
+                '''
+            }
+        }
+
+        stage('[CD-QA] Imprimir IP del servicio') {
+            steps {
+                sh '''
+                  echo ">>> Intentando obtener IP del LoadBalancer (QA)..."
+                  SERVICE_NAME="my-nodejs-service-${APELLIDO}-qa"
+                  LB_IP=""
+                  MAX_RETRIES=10
+                  RETRY_COUNT=0
+        
+                  while [ -z "$LB_IP" ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+                    LB_IP=$(kubectl get svc $SERVICE_NAME -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+                    if [ -z "$LB_IP" ]; then
+                      RETRY_COUNT=$((RETRY_COUNT+1))
+                      echo "Intento $RETRY_COUNT/$MAX_RETRIES: IP aún no asignada, esperando 5s..."
+                      sleep 5
+                    fi
+                  done
+        
+                  if [ -z "$LB_IP" ]; then
+                    echo ">>> No se pudo obtener la IP del LoadBalancer después de $MAX_RETRIES intentos."
+                  else
+                    echo ">>> IP del LoadBalancer (QA): $LB_IP"
+                  fi
+                '''
+            }
+        }
+
+        // --- CD PRD ---
+        stage('Aprobación PRD') {
+            steps {
+                input message: '¿Desea desplegar a PRD?', ok: 'Aprobar'
+            }
+        }
+
+        stage('[CD-PRD] Deploy a AKS') {
+            steps {
+                script { 
+                    env.ENV = "prd"
+                }
+                sh '''
+                  echo ">>> Renderizando k8s.yml para PRD..."
+                  envsubst < k8s.yml > k8s-prd.yml
+                  
+                  echo ">>> Desplegando en AKS (PRD)..."
+                  az aks command invoke \
+                    --resource-group $RESOURCE_GROUP \
+                    --name $AKS_NAME \
+                    --command "kubectl apply -f k8s-prd.yml" \
+                    --file k8s-prd.yml
+                '''
+            }
+        }
+
+        stage('[CD-PRD] Imprimir IP del servicio') {
+            steps {
+                sh '''
+                  echo ">>> Intentando obtener IP del LoadBalancer (PRD)..."
+                  SERVICE_NAME="my-nodejs-service-${APELLIDO}-prd"
+                  LB_IP=""
+                  MAX_RETRIES=10
+                  RETRY_COUNT=0
+        
+                  while [ -z "$LB_IP" ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+                    LB_IP=$(kubectl get svc $SERVICE_NAME -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+                    if [ -z "$LB_IP" ]; then
+                      RETRY_COUNT=$((RETRY_COUNT+1))
+                      echo "Intento $RETRY_COUNT/$MAX_RETRIES: IP aún no asignada, esperando 5s..."
+                      sleep 5
+                    fi
+                  done
+        
+                  if [ -z "$LB_IP" ]; then
+                    echo ">>> No se pudo obtener la IP del LoadBalancer después de $MAX_RETRIES intentos."
+                  else
+                    echo ">>> IP del LoadBalancer (PRD): $LB_IP"
                   fi
                 '''
             }
